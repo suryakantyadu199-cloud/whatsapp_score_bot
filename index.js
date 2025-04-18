@@ -6,7 +6,7 @@ const qrcode = require('qrcode-terminal');
 const mongoose = require('mongoose');
 const fs = require('fs');
 const path = require('path');
-const moment = require('moment-timezone'); // Importar moment-timezone
+const moment = require('moment-timezone');
 const CustomAuthStrategy = require('./CustomAuthStrategy');
 const User = require('./models/User');
 const config = require('./config');
@@ -14,317 +14,283 @@ const config = require('./config');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Función para obtener el nombre del mes actual considerando el día de inicio
+// ———————— Helpers ——————————————————
+
+const isIncrement = msg => /^\+1$/.test(msg);
+const isDecrement = msg => /^-1$/.test(msg);
+const isNumeric = msg => /^\d+$/.test(msg);
+
+async function getContactInfo(client, message) {
+  if (message.from.includes('@g.us')) {
+    const senderId = message.author;
+    if (!senderId) throw new Error('No author en mensaje de grupo');
+    const contact = await client.getContactById(senderId);
+    return {
+      id: senderId,
+      name: contact.pushname || contact.verifiedName || contact.name || 'Usuario'
+    };
+  } else {
+    const senderId = message.from;
+    const contact = await message.getContact();
+    return {
+      id: senderId,
+      name: contact.pushname || contact.verifiedName || contact.name || 'Usuario'
+    };
+  }
+}
+
 function getCurrentMonth() {
-    const now = moment().tz(config.TIMEZONE); // Usar la zona horaria de España
-    const startOfMonth = moment().tz(config.TIMEZONE).date(config.MONTH_START_DAY).startOf('day');
-
-    if (now.isBefore(startOfMonth)) {
-        // Si la fecha actual es antes del día de inicio, considera el mes anterior
-        return now.subtract(1, 'months').format('MMMM');
-    } else {
-        return now.format('MMMM');
-    }
+  const now = moment().tz(config.TIMEZONE);
+  const start = now.clone().date(config.MONTH_START_DAY).startOf('day');
+  return now.isBefore(start)
+    ? now.subtract(1, 'months').format('MMMM')
+    : now.format('MMMM');
 }
 
-// Conectar a MongoDB
-const mongoURI = process.env.MONGODB_URI;
-mongoose.connect(mongoURI)
-    .then(() => console.log('Conectado a MongoDB'))
-    .catch(err => console.error('Error al conectar a MongoDB:', err));
+async function generateRandomCongratsExtra(user) {
+  const randomEmojis = ['🚬','📴','🇵🇪','🕵️‍♂️','🛋','❗','🦩','🧠','🪀','🥏','🌯','🍄','🪳','🔪','🗣️','🫛','🥜','🧑‍🦼','🦿'];
+  const events = ['emoji', 'bestDay', 'worstDay', 'rival'];
+  const choice = events[Math.floor(Math.random() * events.length)];
 
-// Inicializar el cliente de WhatsApp con la estrategia personalizada
+  if (choice === 'emoji') {
+    return ` ${randomEmojis[Math.floor(Math.random() * randomEmojis.length)]}`;
+  }
+
+  const weekMap = user.week || new Map();
+  const days = ['lunes','martes','miércoles','jueves','viernes','sábado','domingo'];
+  const total = days.reduce((sum, d) => sum + (weekMap.get(d) || 0), 0);
+
+  if (choice === 'bestDay') {
+    let best = days[0], cnt = weekMap.get(best) || 0;
+    days.forEach(d => {
+      const c = weekMap.get(d) || 0;
+      if (c > cnt) { cnt = c; best = d; }
+    });
+    const avgOther = ((total - cnt) / (days.length - 1)) || 0;
+    const pct = avgOther > 0 ? Math.round(((cnt - avgOther) / avgOther) * 100) : 0;
+    const dayCap = best.charAt(0).toUpperCase() + best.slice(1);
+    return ` El ${dayCap} es el día que más puntos sueles sumar, sumando un ${pct}% más que el resto.`;
+  }
+
+  if (choice === 'worstDay') {
+    let worst = days[0], cnt = weekMap.get(worst) || 0;
+    days.forEach(d => {
+      const c = weekMap.get(d) || 0;
+      if (c < cnt) { cnt = c; worst = d; }
+    });
+    const avgOther = ((total - cnt) / (days.length - 1)) || 0;
+    const pct = avgOther > 0 ? Math.round(((avgOther - cnt) / avgOther) * 100) : 0;
+    const dayCap = worst.charAt(0).toUpperCase() + worst.slice(1);
+    return ` El ${dayCap} es el día que menos puntos sueles sumar, sumando un ${pct}% menos que el resto.`;
+  }
+
+  // rival
+  const others = await User.find({ _id: { $ne: user._id } });
+  if (!others.length) return '';
+  let closest = null, diff = Infinity;
+  others.forEach(o => {
+    const d = Math.abs(user.totalScore - o.totalScore);
+    if (d < diff) { diff = d; closest = o; }
+  });
+  if (!closest) return '';
+  const rivalName = (closest.displayName && closest.displayName !== 'Usuario')
+    ? closest.displayName
+    : closest._id;
+  const relation = user.totalScore >= closest.totalScore ? 'por encima' : 'por debajo';
+  return ` Tu rival más cercano es ${rivalName} con quien estás a ${diff} puntos de distancia ${relation}.`;
+}
+
+// ———————— DB & Client ——————————————————
+
+mongoose.connect(process.env.MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+})
+  .then(() => console.log('MongoDB conectado'))
+  .catch(err => console.error('Error conectando MongoDB:', err));
+
 const client = new Client({
-    authStrategy: new CustomAuthStrategy({ sessionId: 'default' }),
-    puppeteer: {
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
-    }
+  authStrategy: new CustomAuthStrategy({ sessionId: 'default' }),
+  puppeteer: {
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  }
 });
 
-// Cargar comandos
+// Load commands
 const commands = [];
-const commandsPath = path.join(__dirname, 'commands');
+fs.readdirSync(path.join(__dirname, 'commands'))
+  .filter(f => f.endsWith('.js'))
+  .forEach(f => commands.push(require(path.join(__dirname, 'commands', f))));
 
-fs.readdirSync(commandsPath).forEach(file => {
-    if (file.endsWith('.js')) {
-        const command = require(path.join(commandsPath, file));
-        commands.push(command);
-    }
-});
-
-// Variable global para controlar si responder con "✅"
 let shouldReply = true;
+const setShouldReply = v => shouldReply = v;
+const getShouldReply = () => shouldReply;
 
-// Funciones para modificar la variable shouldReply
-function setShouldReply(value) {
-    shouldReply = value;
-}
+// ———————— Event Listeners ——————————————————
 
-function getShouldReply() {
-    return shouldReply;
-}
-
-// Mostrar el QR en la consola si no está autenticado
-client.on('qr', (qr) => {
-    qrcode.generate(qr, { small: true });
-    console.log('Escanea el QR para autenticar el bot.');
+client.on('qr', qr => {
+  qrcode.generate(qr, { small: true });
+  console.log('Escanea el QR para autenticar');
 });
 
-// Confirmar que el bot está listo
 client.on('ready', () => {
-    console.log('Bot de WhatsApp está listo!');
+  console.log('Bot listo!');
 });
 
-// Manejar eventos de mensajes
+// Procesar "+1"/"-1"
+async function processScoreChange(client, message) {
+  try {
+    const { id, name } = await getContactInfo(client, message);
+    const msg = message.body.trim();
+    const month = getCurrentMonth();
+    const now = moment().tz(config.TIMEZONE);
+    const hourKey = `h${now.hour()}`;
+    const dayKey = now.format('dddd').toLowerCase();
+
+    let user = await User.findById(id);
+    if (!user) {
+      user = new User({
+        _id: id,
+        displayName: name,
+        totalScore: 0,
+        monthlyScores: {},
+        lastCongratulated: 0,
+        hours: {},
+        week: {}
+      });
+    } else if (user.displayName !== name && name !== 'Usuario') {
+      user.displayName = name;
+    }
+
+    let score = user.monthlyScores.get(month) || 0;
+
+    if (isIncrement(msg)) {
+      score++;
+      user.hours.set(hourKey, (user.hours.get(hourKey) || 0) + 1);
+      user.week.set(dayKey, (user.week.get(dayKey) || 0) + 1);
+    } else { // decrement
+      if (score > 0) {
+        score--;
+        user.hours.set(hourKey, Math.max((user.hours.get(hourKey) || 0) - 1, 0));
+        user.week.set(dayKey, Math.max((user.week.get(dayKey) || 0) - 1, 0));
+      } else if (shouldReply) {
+        await message.reply('Ya tienes 0 puntos en este mes, no puedes reducir más.');
+        return;
+      }
+    }
+
+    user.monthlyScores.set(month, score);
+    user.totalScore = Array.from(user.monthlyScores.values()).reduce((a, b) => a + b, 0);
+
+    if (user.totalScore >= user.lastCongratulated + 50 && user.totalScore % 50 === 0) {
+      let text = `${user.displayName} acaba de alcanzar los ${user.totalScore} puntos!!!`;
+      try {
+        text += await generateRandomCongratsExtra(user);
+      } catch (e) {
+        console.error('Error extra felicitación:', e);
+      }
+      await client.sendMessage(message.from, text);
+      user.lastCongratulated = user.totalScore;
+    }
+
+    await user.save();
+    if (shouldReply) {
+      await message.reply(`${score}✅`);
+    }
+  } catch (error) {
+    console.error('Error al actualizar el puntaje:', error);
+    if (shouldReply) {
+      await message.reply(`Hubo un error al actualizar tu puntaje: ${error.message}`);
+    }
+  }
+}
+
+// Procesar mensaje numérico
+async function processNumericMessage(client, message) {
+  try {
+    const { id, name } = await getContactInfo(client, message);
+    const score = parseInt(message.body.trim(), 10);
+
+    if (isNaN(score) || score < 0) {
+      if (shouldReply) {
+        await message.reply('Por favor, envía un número válido positivo.');
+      }
+      return;
+    }
+
+    const month = getCurrentMonth();
+    let user = await User.findById(id);
+
+    if (user) {
+      user.monthlyScores.set(month, score);
+      user.totalScore = Array.from(user.monthlyScores.values()).reduce((a, b) => a + b, 0);
+      if (user.displayName !== name && name !== 'Usuario') {
+        user.displayName = name;
+      }
+    } else {
+      user = new User({
+        _id: id,
+        displayName: name,
+        totalScore: score,
+        monthlyScores: { [month]: score },
+        lastCongratulated: score >= 50 && score % 50 === 0 ? score : 0,
+        hours: {},
+        week: {}
+      });
+      if (score >= 50 && score % 50 === 0) {
+        await client.sendMessage(message.from, `${name} acaba de alcanzar los ${score} puntos!!!`);
+      }
+    }
+
+    if (user.totalScore >= user.lastCongratulated + 50 && user.totalScore % 50 === 0) {
+      await client.sendMessage(message.from, `${user.displayName} acaba de alcanzar los ${user.totalScore} puntos!!!`);
+      user.lastCongratulated = user.totalScore;
+    }
+
+    await user.save();
+    if (shouldReply) {
+      await message.react('✅');
+    }
+  } catch (error) {
+    console.error('Error al registrar tu puntaje:', error);
+    if (shouldReply) {
+      await message.reply(`Hubo un error al registrar tu puntaje: ${error.message}`);
+    }
+  }
+}
+
 client.on('message', async message => {
+  try {
     const msg = message.body.trim();
 
-    // Expresiones regulares para "+1" y "-1"
-    const numberIncrementRegex = /^\+1$/;
-    const numberDecrementRegex = /^-1$/;
-
-    // Expresión regular para detectar mensajes que son solo números
-    const numberRegex = /^\d+$/;
-
-    // Función para procesar incrementos/decrementos
-    const processScoreChange = async () => {
-        let senderId;
-        let displayName;
-
-        if (message.from.includes('@g.us')) {
-            // Mensaje de grupo
-            senderId = message.author;
-            if (!senderId) {
-                console.warn('Mensaje de grupo sin author, no se puede procesar.');
-                return;
-            }
-            // Obtener el nombre del contacto
-            const contact = await client.getContactById(senderId);
-            displayName = contact.pushname || contact.verifiedName || contact.name || 'Usuario';
-        } else {
-            // Mensaje individual
-            senderId = message.from;
-            const contact = await message.getContact();
-            displayName = contact.pushname || contact.verifiedName || contact.name || 'Usuario';
-        }
-
-        // Obtener el mes actual considerando el día de inicio
-        const currentMonth = getCurrentMonth();
-
-        // Obtener la hora actual en España Peninsular
-        const currentHour = moment().tz(config.TIMEZONE).hour(); // Devuelve un número entre 0 y 23
-        const hourKey = `h${currentHour}`;
-
-        // Obtener el día de la semana actual
-        const currentDay = moment().tz(config.TIMEZONE).format('dddd').toLowerCase();
-
-        try {
-            let user = await User.findById(senderId);
-
-            if (!user) {
-                // Crear un nuevo usuario si no existe
-                user = new User({
-                    _id: senderId,
-                    displayName: displayName,
-                    totalScore: 0,
-                    monthlyScores: {},
-                    lastCongratulated: 0,
-                    hours: {},
-                    week: {}
-                });
-            } else {
-                // Actualizar el displayName si ha cambiado
-                if (user.displayName !== displayName && displayName !== 'Usuario') {
-                    user.displayName = displayName;
-                }
-            }
-
-            // Obtener el puntaje actual del mes
-            let currentMonthScore = user.monthlyScores.get(currentMonth) || 0;
-
-            if (numberIncrementRegex.test(msg)) {
-                // Incrementar el puntaje en 1
-                currentMonthScore += 1;
-                // Incrementar el contador correspondiente
-                user.hours.set(hourKey, (user.hours.get(hourKey) || 0) + 1);
-                user.week.set(currentDay, (user.week.get(currentDay) || 0) + 1);
-            } else if (numberDecrementRegex.test(msg)) {
-                // Decrementar el puntaje en 1 si es mayor que 0
-                if (currentMonthScore > 0) {
-                    currentMonthScore -= 1;
-                    // Decrementar el contador correspondiente, asegurando que no sea negativo
-                    user.hours.set(hourKey, Math.max((user.hours.get(hourKey) || 0) - 1, 0));
-                    user.week.set(currentDay, Math.max((user.week.get(currentDay) || 0) - 1, 0));
-                } else {
-                    if (shouldReply) {
-                        await message.reply('Ya tienes 0 puntos en este mes, no puedes reducir más.');
-                    }
-                    return;
-                }
-            }
-
-            // Actualizar el puntaje del mes actual
-            user.monthlyScores.set(currentMonth, currentMonthScore);
-
-            // Recalcular el puntaje total
-            user.totalScore = Array.from(user.monthlyScores.values()).reduce((a, b) => a + b, 0);
-
-            // Verificar si el totalScore alcanza un múltiplo de 50 y no ha sido felicitado para este múltiplo
-            if (user.totalScore >= user.lastCongratulated + 50 && user.totalScore % 50 === 0) {
-                // Enviar felicitación
-                await client.sendMessage(message.from, `${user.displayName} acaba de alcanzar los ${user.totalScore} puntos!!!`);
-                // Actualizar lastCongratulated
-                user.lastCongratulated = user.totalScore;
-            }
-
-            // Guardar los cambios
-            await user.save();
-
-            // Responder con el puntaje actual
+    if (isIncrement(msg) || isDecrement(msg)) {
+      await processScoreChange(client, message);
+    } else if (isNumeric(msg)) {
+      await processNumericMessage(client, message);
+    } else {
+      for (const cmd of commands) {
+        if (cmd.match.test(msg)) {
+          try {
+            await cmd.callback(client, message, { setShouldReply, getShouldReply });
+          } catch (e) {
+            console.error('Error ejecutando comando:', e);
             if (shouldReply) {
-                await message.reply(`${currentMonthScore}✅`);
+              await message.reply('Hubo un error al ejecutar el comando.');
             }
-        } catch (error) {
-            console.error('Error al actualizar el puntaje:', error);
-            if (shouldReply) {
-                await message.reply('Hubo un error al actualizar tu puntaje. Por favor, intenta nuevamente.');
-            }
+          }
+          break;
         }
-    };
-
-    // Función para procesar mensajes numéricos
-    const processNumericMessage = async () => {
-        let senderId;
-        let displayName;
-
-        if (message.from.includes('@g.us')) {
-            // Mensaje de grupo
-            senderId = message.author; // ID del remitente dentro del grupo
-            if (!senderId) {
-                console.warn('Mensaje de grupo sin author, no se puede procesar.');
-                return;
-            }
-            // Obtener el nombre del contacto
-            const contact = await client.getContactById(senderId);
-            displayName = contact.pushname || contact.verifiedName || contact.name || 'Usuario';
-        } else {
-            // Mensaje individual
-            senderId = message.from; // ID del remitente
-            const contact = await message.getContact();
-            displayName = contact.pushname || contact.verifiedName || contact.name || 'Usuario';
-        }
-
-        const score = parseInt(msg, 10);
-
-        // Validar que el puntaje sea un número positivo
-        if (isNaN(score) || score < 0) {
-            if (shouldReply) {
-                await message.reply('Por favor, envía un número válido positivo.');
-            }
-            return;
-        }
-
-        // Actualizar las estadísticas en MongoDB
-        try {
-            // Obtener el mes actual considerando el día de inicio
-            const currentMonth = getCurrentMonth();
-            let user = await User.findById(senderId);
-
-            if (user) {
-                // Actualizar el puntaje para el mes actual
-                user.monthlyScores.set(currentMonth, score);
-                // Actualizar el puntaje total
-                user.totalScore = Array.from(user.monthlyScores.values()).reduce((a, b) => a + b, 0);
-                // Actualizar el displayName si ha cambiado
-                if (user.displayName !== displayName && displayName !== 'Usuario') {
-                    user.displayName = displayName;
-                }
-
-            } else {
-                // Crear un nuevo usuario
-                user = new User({
-                    _id: senderId,
-                    displayName: displayName,
-                    totalScore: score,
-                    monthlyScores: { [currentMonth]: score },
-                    lastCongratulated: score >= 50 && score % 50 === 0 ? score : 0,
-                    hours: {},
-                    week: {}
-                });
-
-                // Si el score es múltiplo de 50 al crearse, enviar felicitación
-                if (score >= 50 && score % 50 === 0) {
-                    await client.sendMessage(message.from, `${user.displayName} acaba de alcanzar los ${score} puntos!!!`);
-                }
-            }
-
-            // Verificar si el totalScore alcanza un múltiplo de 50 y no ha sido felicitado para este múltiplo
-            if (user.totalScore >= user.lastCongratulated + 50 && user.totalScore % 50 === 0) {
-                // Enviar felicitación
-                await client.sendMessage(message.from, `${user.displayName} acaba de alcanzar los ${user.totalScore} puntos!!!`);
-                // Actualizar lastCongratulated
-                user.lastCongratulated = user.totalScore;
-            }
-
-            // Guardar los cambios
-            await user.save();
-
-            // Responder con un "✅" si está habilitado
-            if (shouldReply) {
-                await message.react('✅');
-            }
-        } catch (error) {
-            console.error('Error al actualizar las estadísticas:', error);
-            if (shouldReply) {
-                await message.reply('Hubo un error al registrar tu puntaje. Por favor, intenta nuevamente.');
-            }
-        }
-    };
-
-    // Procesar incrementos/decrementos
-    if (numberIncrementRegex.test(msg) || numberDecrementRegex.test(msg)) {
-        processScoreChange();
-        return; // Salir después de manejar "+1" o "-1"
+      }
     }
-
-    // Procesar mensajes numéricos
-    if (numberRegex.test(msg)) {
-        processNumericMessage();
-        return;
-    }
-
-    // Procesar comandos
-    for (const command of commands) {
-        if (command.match.test(msg)) {
-            try {
-                // Ejecutar el comando sin bloquear el ciclo de eventos
-                command.callback(client, message, { setShouldReply, getShouldReply });
-            } catch (error) {
-                console.error('Error al ejecutar el comando:', error);
-                if (shouldReply) {
-                    message.reply('Hubo un error al ejecutar el comando.');
-                }
-            }
-            break; // Ejecuta solo el primer comando que coincida
-        }
-    }
+  } catch (e) {
+    console.error('Error procesando mensaje:', e);
+  }
 });
 
-// Manejar errores del cliente
-client.on('error', (error) => {
-    console.error('Error del cliente de WhatsApp:', error);
-});
+client.on('error', console.error);
 
-// Iniciar el cliente
 client.initialize();
 
-// Configurar una ruta básica para mantener el app viva
-app.get('/', (req, res) => {
-    res.send('Bot de WhatsApp está funcionando.');
-});
-
-// Iniciar el servidor Express
-app.listen(PORT, () => {
-    console.log(`Servidor Express escuchando en el puerto ${PORT}`);
-});
+app.get('/', (_req, res) => res.send('Bot de WhatsApp está funcionando.'));
+app.listen(PORT, () => console.log(`Servidor Express escuchando en el puerto ${PORT}`));
